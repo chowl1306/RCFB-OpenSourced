@@ -391,29 +391,6 @@ Full history is in the project's changelog.
 
 ## Licensing and purchase
 
-<!-- FILL IN: replace every bracketed block below with your real terms. -->
-
-**Price:** [YOUR PRICE]
-
-**What the license covers:** [e.g. one machine, one user, perpetual
-use of the purchased major version, free updates within that major
-version]
-
-**What the license does not cover:** [e.g. redistribution, resale,
-reverse engineering, use on machines you do not own or control]
-
-**Refund policy:** [e.g. refunds within 14 days if the software does
-not work as described, minus payment processor fees]
-
-**Payment methods:** [list them]
-
-**How to buy:** Open a purchase ticket in this server. A staff member
-will confirm the details and provide payment instructions.
-
-**How delivery works:** After payment is confirmed you receive the
-Customer role, which unlocks the downloads channel. Your license key
-and the current build are posted there.
-
 ---
 
 ## Support
@@ -430,10 +407,9 @@ When opening a ticket, include:
 - Any error message, in full
 - Your Windows version
 
-**Support contact:** [FILL IN - e.g. "Open a ticket in #support" or an
-email address]
+**Support contact:** zabalotony@cocaine.xyz
 
-**Response time:** [FILL IN - e.g. "usually within 24 hours"]
+**Response time:** within 72hrs
 
 ---
 

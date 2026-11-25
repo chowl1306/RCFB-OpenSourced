@@ -1,0 +1,994 @@
+CHANGELOGS
+==========
+
+Current version: 2.0   (2026-10-09)
+
+
+Versioning
+----------
+* A version is always two numbers: `n.n`. Never three parts, never a suffix.
+* Every update increments the minor part by exactly 0.1:
+      0.1 -> 0.2 -> 0.3 -> ... -> 0.9 -> 1.0 -> 1.1 -> ...
+  There is no special meaning to crossing 1.0; it is just the next step.
+* One version is one complete, verified change set - not one commit, not one
+  file. Several files moving together is still one version.
+* Newest entry first. The top entry is always the version currently on disk.
+* This file is the single source of truth for the version number. Nothing in
+  the code carries it, so there is nothing to keep in sync.
+* Entry sections, in this order, omitting any that are empty:
+      Added    - new capability
+      Changed  - existing behaviour that now behaves differently
+      Fixed    - a defect that produced wrong behaviour
+      Removed  - something deleted, with what replaced it
+      Verified - what was actually exercised for this version
+* Record behaviour changes precisely, especially anything that alters the wire
+  format between static/script.js and server.py. The two are deployed together
+  and nothing version-checks them, so a mismatch must be called out here.
+* A version that changes no code (documentation, audit) still counts and still
+  takes the next number.
+
+
+History
+-------
+
+2.0  -  2026-10-09  -  Second audit: 18 defects across the server, the CLI and the client
+--------------------------------------------------------------------------------
+  Added
+    * Auto_OBF.bat: builds the whole protected release into "RELEASE BUILDS"
+      in one step - rcfb.exe, rcfb-cli.exe, .env, start.bat, HOWTO.txt and
+      BUILD_REPORT.txt (sizes and SHA-256 of both exes). It generates a
+      32-character release password on first run and reuses it afterwards, so
+      rebuilding does not change the password of a release already in use;
+      delete the folder's .env to force a new one. The password is written to
+      that .env and bundled into rcfb.exe as its fallback, so the exe and the
+      file beside it always agree, and the project's development password is
+      not in the release at all. Both builds pass
+      --python-flag=no_docstrings, so the shipped binaries carry no readable
+      Python and no docstrings. The last step audits the folder and fails the
+      build if any .py, .pyc, __pycache__ or unexpected directory reached it.
+    * build-cli.bat: the same kind of onefile Nuitka build as build.bat, for
+      the control panel. It produces build\rcfb-cli.exe beside build\rcfb.exe,
+      which is the layout a release folder uses. It needs no --include-data-*
+      flags and no --include-module: rcfb_cli.py is pure standard library, and
+      its frozen-build support (__compiled__ / containing_dir in EXE_DIR, and
+      python_executable() knowing not to treat sys.executable as an
+      interpreter) was already in place.
+
+  Fixed
+    Server
+    * AUDIT-01  POST /logout released every session's held keys whenever the
+      logging-out browser had not pressed anything yet. logout() passed
+      session.get("sid") straight to release_all_keys(), and a missing sid is
+      that function's "every session" signal, so one browser signing out let go
+      of the keys another browser was still holding. A session with no sid has
+      no presses of its own, so logout now releases nothing in that case.
+      (AUDIT-01)
+
+    * AUDIT-02  Stream entries never expired. frames() stamped an entry's
+      liveness with time.time() (epoch seconds, ~1.79e9) while the stale sweep
+      in stream_config() compared that same field against time.monotonic()
+      (seconds since boot, ~2.6e4), so the age it computed was a large negative
+      number and the sweep could not evict any entry that had ever streamed.
+      _streams grew by one entry per session that opened /screen, for the life
+      of the process, and the BUG-03 guard passed only because nothing was ever
+      evicted. The liveness stamp and the frame pacing now use time.monotonic().
+      (AUDIT-02, AUDIT-03)
+
+    * AUDIT-04  /upload had no per-file limit. UPLOAD_MAX_BYTES (256 MiB) was
+      defined and referenced nowhere, so only Flask's 512 MiB request limit
+      applied, and the 2 GiB transfer-directory cap was checked only before the
+      write and never after, so it could be overshot by a whole upload. The
+      size is now taken from Content-Length before the body is written and from
+      the file afterwards, the per-file cap is enforced, and a file that breaks
+      either limit is removed rather than left behind. A directory whose usage
+      cannot be read counts as full instead of empty. (AUDIT-04)
+
+    * AUDIT-05  A JSON object or array as a key name or a mouse button raised
+      TypeError: unhashable type out of the validation that was supposed to
+      answer 400, so POST /keyboard {"key": {}} and POST /mouse {"button": []}
+      returned 500 with a traceback. Both are rejected as intended now.
+      (AUDIT-05)
+
+    * AUDIT-06  key_up() released the key name supplied by the release event
+      rather than the key recorded at press time. It popped the stored key but
+      called keyboard.release() on the caller's argument, so a client whose
+      keyup names a different key than its keydown released the wrong physical
+      key and left the pressed one held with nothing tracking it. Reachable
+      from the shipped client, which forwards event.key: hold Shift, press a
+      letter, release Shift first. (AUDIT-06)
+
+    * AUDIT-07  /text pressed and released each character directly on the
+      controller, bypassing the _pressed table. It could therefore release a
+      key that /keyboard was holding, and a press whose release raised left a
+      stuck key that no state tracked. Batch typing now goes through the same
+      key_down()/key_up() bookkeeping as every other key source. (AUDIT-07)
+
+    * AUDIT-08  _last_stream_error was one process-wide flag. A failure on one
+      session's stream was reported to another session's /ping, and any healthy
+      frame on any stream cleared it, so a client whose own stream had
+      permanently failed was told stream_error was null. The error now belongs
+      to the stream entry, and /ping reports the stream of the session asking.
+      (AUDIT-08)
+
+    * AUDIT-09  When no display could be enumerated, frames() slept 0.5s and
+      continued forever without counting the attempt and without recording
+      anything, so /screen never yielded, never returned, and /ping kept
+      reporting the stream healthy: a blank picture under a "connected" status
+      with no explanation. That path now counts toward STREAM_MAX_FAILURES,
+      ends the stream and records "no display available to capture". BUG-26
+      covered grab() exceptions only, not this one. (AUDIT-09)
+
+    * AUDIT-10  Two requests arriving together on first page load each minted
+      their own stream token - the <img> for /screen and the first /ping both
+      found no token in their copy of the session. The cookie kept one token
+      while the live generator streamed on the other, so every later
+      /stream-settings change went to the entry nobody was reading and was
+      silently ignored until the page was reloaded. The entry is now keyed by
+      the session id, which is minted at login, so concurrent requests agree.
+      (AUDIT-10)
+
+    * AUDIT-11  bool is a subclass of int, so true and false passed the numeric
+      validation for coordinates and for wheel deltas; a malformed client could
+      inject scroll(1, 0) or move to a boolean-derived position instead of
+      being rejected. (AUDIT-11)
+
+    CLI
+    * CLI-01  Config > Edit accepted an empty value for any key, PASSWORD
+      included, and reported "Saved PASSWORD (0 characters)." The server reads
+      PASSWORD= as no password and exits with "rcfb: PASSWORD is missing from
+      .env", so an edit the tool called a success stopped the server from
+      starting. An empty value is refused, and PASSWORD keeps the first-run
+      screen's four-character minimum.
+
+    * CLI-02  The password the CLI wrote was not the password the server read.
+      write_env_value wrote key=value verbatim while server.py parses a value
+      as value.strip().strip("\"'"), so a password with a leading or trailing
+      space, or typed inside quotes, was stored differently from what was
+      typed - and the field is masked, so there was no way to see why the login
+      just configured was refused. Values that would not round-trip are now
+      refused with an explanation instead of being written.
+
+    * CLI-03  Stop discarded the record after a failed stop. clear_state() ran
+      unconditionally once the kill attempts had been made, even when every
+      terminate_pid() had failed, so state.json was deleted while the process
+      was still running and the next Stop could no longer identify the onefile
+      bootstrap. The record is now kept unless every process it names stopped,
+      and the screen says so.
+
+    * CLI-04  A network that was merely wrong bricked the tool. Any HTTP 200
+      whose body did not contain the version string was classified as a bad
+      version, so a captive portal or a TLS-inspecting proxy was
+      indistinguishable from a tampered build and dropped the user into a
+      screen with no menu and no way past it except Ctrl+C. Only a clean 404
+      means "this version was never published" and is treated as bad; anything
+      else is skipped, which is what the surrounding code already intended.
+
+    * CLI-05  A recorded pid was trusted as the server on pid_alive() alone, so
+      after the server was killed and Windows reused its number for an
+      unrelated python.exe, Status reported that process as the running server
+      with an invented uptime, Doctor skipped the port probe entirely, and Stop
+      included it because python.exe is in SAFE_IMAGES - so confirming Stop
+      could terminate a program this tool never started. The record is now
+      trusted only while the port is held by one of the recorded processes,
+      which is what keeps the onefile bootstrap-plus-child pair working; the
+      port holder is still the fallback when the port is in use but the record
+      does not name it.
+
+    * CLI-06  On Unix, find_port_holder scanned every integer in `ss -ltnp`
+      output and returned the first one that was alive, so it picked up address
+      octets and header numbers - PID 1 is alive on any Unix, so that is what
+      it reported. It now reads lsof's pid list, or the pid= fields of the
+      listening socket line.
+
+    * CLI-07  server.py anchored its runtime state to the executable's folder
+      for Nuitka builds only, and the CLI offers PyInstaller flavors as well.
+      Under PyInstaller onefile, BASE_DIR resolved inside the temporary
+      extraction directory that is deleted when the process exits, so uploads
+      were destroyed with it and the .env the CLI's Config screen writes beside
+      the exe was never the one load_env() read. server.py now handles
+      sys.frozen / sys._MEIPASS: bundled read-only resources (static/, the
+      fallback .env) are found in the extraction directory, and state that must
+      outlive the process (transfers/, a user supplied .env) goes beside the
+      executable.
+
+    Website
+    * WEB-01  Text was silently dropped when a second Send landed while a
+      typing job was still running. The button and the Enter handler clear the
+      box before calling sendText(), which returned immediately when a job was
+      in flight, so what had just been typed was gone and never restored. The
+      failure path already put the text back (1.2); this path now does too,
+      with a toast saying why.
+
+  Changed
+    * /ping's stream_error describes the stream of the session asking rather
+      than a process-wide flag. The field name and the response shape are
+      unchanged, so static/script.js needs no matching change.
+    * The per-session stream entry is keyed by the session id, minted at login
+      and carried in the cookie. session["stream"] holds the same value, so
+      nothing on the wire changed.
+    * /upload answers 413 for a file over the per-file cap and removes it. The
+      transfer-directory cap is enforced after the write as well as before, and
+      a directory that cannot be measured counts as full.
+    * Config > Edit and the first-run password screen refuse values that would
+      not round-trip through the server's .env parser, and refuse an empty
+      value.
+    * Stop keeps state.json unless every recorded process stopped.
+    * The version check calls a version bad only on a clean HTTP 404.
+    * Status, Doctor and Stop trust a recorded pid only while the port is held
+      by one of the recorded processes.
+
+  Removed
+    * The module-level _last_stream_error flag, replaced by a per-stream entry
+      field with set_stream_error()/stream_error(). UPLOAD_MAX_BYTES is no
+      longer dead: /upload enforces it.
+
+  Verified
+    * tests/server_check.py: 111 checks, all passing (was 64). The new checks
+      are the AUDIT-01..AUDIT-11 group.
+    * Reproduced before the fix, by execution: a logout from a session with no
+      sid released another session's Control; a liveness stamp taken with
+      time.time() read ~1.79e9 against a monotonic clock of ~2.6e4, and an
+      entry idle for 100000s survived the sweep; a 2000-byte upload against a
+      1500-byte per-file cap was accepted, and two 2000-byte uploads against a
+      3000-byte cap both landed, leaving 4000 bytes on disk; {"key": {}} and
+      {"button": []} raised TypeError out of the view instead of answering 400;
+      down "a" followed by up "A" injected release(A); and true/false were
+      accepted as coordinates and as wheel deltas.
+    * Established by reading, then fixed and covered by a new check: /text
+      reached the controller around the _pressed table; the stream error was a
+      single global; the no-display path looped without ever returning; and two
+      first requests of one session could mint different tokens.
+    * The website fix was reproduced and then confirmed in real Chromium
+      against a stub server, before and after. Before: the first send left the
+      box empty, the second send was discarded with no toast, and the stub
+      received only the first text. After: the box held the second text, the
+      toast read "still typing the previous text", and the stub still received
+      only the first text - nothing was sent twice and nothing was lost.
+    * The CLI fixes were exercised directly: write_env_value round-trips
+      through the server's parser; Config > Edit refuses empty, quoted and
+      space-padded values and still saves a good one; check_version answers bad
+      only for a 404, skipped for a proxy interstitial and for a 500, ok for
+      the real blob; server_pids reports a stale record as stale, does not
+      treat a foreign port holder as ours, and trusts a record the port agrees
+      with; Stop keeps state.json after a failed or partial stop and clears it
+      after a complete one; the ss and lsof parsing returns the listener pid
+      rather than an address octet.
+    * Not exercised: the Unix branch of find_port_holder against a real Unix
+      host (this machine is Windows), and a PyInstaller build of rcfb.exe -
+      CLI-07 is verified as the runtime-path logic plus the existing Nuitka
+      behaviour, not by building a second frozen artifact.
+
+1.9  -  2026-10-09  -  Camera follow on the left and upper half of the screen
+--------------------------------------------------------------------------------
+  Fixed
+    * clampPan() bounded the camera pan at 0 at the upper end instead of at
+      -base, so only negative pan survived the clamp. Negative pan is the half
+      that follows the remote cursor into the right and lower half of the
+      screen; every positive pan - the left and upper half - was clamped back
+      to 0 and the picture did not move at all. On the touchpad, dragging the
+      remote cursor past the middle of the screen to the left or upwards
+      therefore left the camera parked where it was, while dragging right or
+      down followed normally. The same clamp anchors a zoom (setZoom() goes
+      through panFor()), so zooming in with the cursor on the left of the
+      screen anchored the view as if the cursor were at the far right.
+
+      The bound is now -base, which is exactly the pan that parks the near
+      edge of the picture against the near edge of the viewport, so the
+      "never pull away from the viewport edges" rule is unchanged: the
+      picture still covers the viewport on any axis where it is larger than
+      it, and is still centred on any axis where it is smaller.
+
+  Verified
+    * Reproduced first, in Chromium, against the server running from source,
+      viewport 1200x480 with a 1920x1080 remote, zoom 2:
+        before  panFor({x:0.9,y:0.5}) -> pan.x -253.33, picture at -253.33
+                panFor({x:0.1,y:0.5}) -> pan.x    0.00, picture at -253.33
+        both ends of the horizontal axis produced the identical picture, so
+        the camera was pinned to the right-hand extreme and ignored the left.
+        The vertical axis behaved the same way ({y:0.1} matched {y:0.9}).
+        after   panFor({x:0.1,y:0.5}) -> pan.x +253.33, picture at 0
+                panFor({x:0.9,y:0.5}) -> pan.x -253.33, picture at -253.33
+                panFor({x:0.5,y:0.1}) -> pan.y +240.00, picture at 0
+    * Real input, not just the arithmetic: a touchpad drag with the mouse
+      (pointerdown, ten pointermove steps, pointerup) moved the remote cursor
+      from 0.5 to 0.3 and the picture from -253.33 to 0; a drag the other way
+      moved the cursor to 0.7 and the picture to -506.67, flush with the right
+      viewport edge. Both directions follow, and both stop at the edge.
+    * Sweep over zoom 1, 1.5, 2, 3, 4 crossed with seven cursor positions
+      (all four corners, both mid-edges, centre): the picture covered the
+      viewport on every axis where it was larger than it and was centred where
+      it was smaller, the cursor always landed inside the viewport, and the
+      picture's left edge was monotonic across an eleven-step horizontal
+      sweep - moving the cursor right never moved the picture left.
+    * No wire-format change: static/script.js only. server.py is untouched.
+
+1.8  -  2026-10-08  -  Packaged as a single executable
+--------------------------------------------------------------------------------
+  Added
+    * build.bat produces build\rcfb.exe with Nuitka in onefile mode: one file,
+      no Python installation and no pip step needed on the target machine.
+      static/ and .env are bundled into it. pynput resolves its backend through
+      importlib at runtime, which static analysis cannot see, so the Windows
+      keyboard and mouse backends are named with --include-module explicitly.
+
+  Changed
+    * Where runtime state lives once the program is frozen. A onefile build
+      unpacks its bundled files into a temporary directory that is deleted when
+      the process exits, so the transfers directory cannot live beside __file__
+      any more: it is anchored to the folder holding the executable, which is
+      what RCFB_DIR already allowed. Running from source, that folder is the
+      project directory, so nothing moves.
+    * .env is read from beside the executable first and from the bundled copy
+      second, so the password can be changed without a rebuild. Bundled .env is
+      still the fallback, so a lone rcfb.exe works on its own.
+
+  Verified
+    * tests/server_check.py: 64 checks, all passing, running from source.
+    * rcfb.exe launched from an empty directory with nothing beside it, and
+      driven over HTTP against the real running process:
+        GET /login 200, POST /login with the bundled password 200,
+        GET / 200 serving the bundled index.html,
+        GET /static/script.js and /static/style.css 200 with correct types,
+        GET /ping {"ok":true,"stream_error":null},
+        GET /monitors 1 display, 1920x1080 at 0,0 - so mss and PIL work frozen,
+        GET /screen 200 multipart/x-mixed-replace carrying a real JPEG frame,
+        POST /upload then POST /download round-tripping a 2048 byte file,
+        with the file landing in transfers\ next to rcfb.exe.
+    * Not exercised: the input-injection endpoints themselves. The keyboard and
+      mouse controllers are constructed at import time, so a frozen exe that
+      starts at all has already resolved pynput's runtime backend, but a real
+      press or click would move this machine's input, so it was left alone.
+
+1.7  -  2026-10-06  -  Bug 34 of 34: separate scroll accumulators
+--------------------------------------------------------------------------------
+  Fixed
+    * BUG-34  The mouse wheel and the touchpad gestures shared one sub-notch
+      accumulator, so a partial notch left by the wheel could be completed by
+      the next two-finger scroll, producing a stray notch from the other input
+      source. Each source now keeps its own remainder.
+      Verified in Chromium: a 60px wheel event left the wheel remainder at 60
+      and the touch remainder at 0; a following 60px two-finger scroll moved
+      the touch remainder to -60 and left the wheel's at 60, and neither
+      produced a scroll event. Under the old shared accumulator the two would
+      have summed to a full notch and emitted one.
+
+  Note
+    * This is the last of the 34 findings in KNOWN_BUGS.txt. All are fixed and
+      that file now carries a resolution index mapping each finding to the
+      version that fixed it.
+    * 33 of the 34 were reproduced before being fixed. The exceptions are the
+      two host-power actions in BUG-27 - running either would lock this
+      machine - so their fix is verified as wiring only.
+
+
+1.6  -  2026-10-06  -  Bugs 31-33 of 34: nested scroll, background polling, staleness
+--------------------------------------------------------------------------------
+  Fixed
+    * BUG-31  The keyboard panel scrolls vertically while the function-key row
+      scrolls horizontally, and without containment a swipe that reached the
+      end of one axis chained into the other, which on a phone reads as the
+      layout jumping. Both scrollers now use overscroll-behavior: contain.
+      Verified: the computed style reports contain on the panel and contain on
+      the row's horizontal axis. The touch feel itself cannot be reproduced
+      headlessly; this is verified as applied styling, not as a gesture.
+    * BUG-32  The latency poll ran every 5s regardless of visibility, waking
+      the radio on a phone for a number nobody was looking at. The guard was
+      extracted into pollLatency() so it can be exercised directly.
+      Verified: calling pollLatency() while hidden issues no request, and
+      while visible issues one. An earlier attempt to measure this by timing
+      the interval was invalid - this harness freezes page timers, so both
+      the hidden and visible phases measured zero; that is why the guard was
+      made directly callable rather than left to a timer.
+    * BUG-33  A backgrounded tab can lose its stream without the element ever
+      firing error, leaving a frozen picture and a status line that still
+      claimed to be connected, so the existing recovery - which only acted
+      when the status was wrong - never ran. Returning after more than three
+      seconds away now reopens the stream regardless of the status, and a
+      brief absence does not.
+      Verified: returning after a simulated 10s absence reopened the stream
+      (the source gained its cache-busting parameter and settled back to
+      "connected"); a 200ms absence did not.
+
+  Verified
+    * Server suite unchanged and still green: 64 checks, 0 fail.
+
+
+1.5  -  2026-10-06  -  Bugs 28-30 of 34: bounded table, fps guard, atomic uploads
+--------------------------------------------------------------------------------
+  Fixed
+    * BUG-28  The login-failure table pruned timestamps on read but never the
+      key set, so a flood of distinct keys - which a forged forwarded header
+      produces cheaply - grew it without limit. It is now bounded: expired
+      keys are dropped and, if still over 1024, the least recently failing
+      keys go first.
+      Verified: 1224 distinct keys leave the table at or below the cap, and
+      the lockout itself still works for a real address.
+    * BUG-29  1.0 / fps had no guard, so a corrupt fps of 0 would end the
+      stream with a ZeroDivisionError raised from inside the generator. The
+      interval is now computed against max(1, fps).
+      Verified by consuming two frames: the old check stopped after one and
+      so never reached the division at all, which is why it passed before.
+    * BUG-30  Upload naming was a check-then-act: exists() then save(), so two
+      uploads of the same name racing could choose the same target and one
+      would silently overwrite the other. Names are now claimed with
+      O_CREAT|O_EXCL, making the test and the create a single step.
+      Verified with six threads uploading "race.txt" at once: all six
+      succeeded, all six names were distinct, and all six file contents
+      survived.
+
+  Changed
+    * Uploads that exhaust the name search now answer 409 instead of looping.
+
+  Verified
+    * Server suite: 64 checks pass, 0 fail. Two checks were strengthened first
+      (BUG-29 now consumes two frames; BUG-30 now races six uploads) because
+      the originals passed without exercising the bug.
+
+
+1.4  -  2026-10-06  -  Bugs 25-27 of 34: display identity, stream health, confirms
+--------------------------------------------------------------------------------
+  Fixed
+    * BUG-25  The selected monitor was stored as a bare index, so unplugging a
+      display handed the session to whatever now occupied that slot - the
+      stream would silently follow a different physical screen and mouse
+      coordinates would be wrong for it. The selection is now stored as the
+      display's geometry and re-matched on every use; if that display is gone
+      the session falls back to the first one instead of following the
+      replacement, and /monitors reports the fallback so the picker agrees.
+      Verified: with the small display replaced by a 1920x1080 one in the same
+      slot, the selection reported index 0 and the pointer mapped to the
+      800x600 display rather than the replacement.
+    * BUG-26  A permanent capture failure looped forever with no way for the
+      client to tell, so it showed a blank picture and a status line reading
+      "connected". The generator now counts consecutive failures, gives up
+      after 20, and records the reason; /ping reports it and the status line
+      shows it.
+      Verified: against a device that always raises, the loop stops, the error
+      is recorded, and /ping carries it.
+    * BUG-27  Host lock and Ctrl+Alt+Del fired on a single click with no
+      confirmation, and the Ctrl+Alt+Del button gave no hint that Windows will
+      normally refuse it. Both now confirm first, and the Ctrl+Alt+Del prompt
+      says it will usually fail.
+      Note: these two paths are still the only ones never executed - running
+      either would lock this machine. The confirmation is verified only as
+      wiring, not by performing the action.
+
+  Changed
+    * /ping returns JSON ({"ok": true, "stream_error": ...}) instead of an
+      empty 204, so the client can show capture failures. The client parses it.
+    * monitor_at() removed as dead code once the resolver took over.
+
+  Verified
+    * Server suite: 59 checks pass, 1 fails - only the unfixed BUG-28.
+    * Two checks were found to be weaker than they looked and will be
+      strengthened next: BUG-29 only consumed one frame, so it never reached
+      the division that the bug is about, and BUG-30 only asserted the -1
+      suffix, not the atomicity it is about. Both are recorded in Pending.
+
+
+1.3  -  2026-10-06  -  Bugs 22-24 of 34: cookie security, transfer dir, device lock
+--------------------------------------------------------------------------------
+  Fixed
+    * BUG-22  The session cookie was never marked Secure, so over the https
+      tunnel it would still be sent over a plain http request. It is now
+      marked Secure when the request arrived over https, detected from the
+      proxy's X-Forwarded-Proto, but not over plain http on 127.0.0.1 where a
+      Secure cookie would simply never be sent back and login would break.
+      Verified: a request through the tunnel gets a Secure cookie, a plain
+      local request does not.
+    * BUG-23  Uploads went to the host's real ~/Downloads and /download would
+      read any single file in it, so a compromised session had the whole
+      folder in reach and could write into it without limit. Transfers now
+      live in their own directory (RCFB_DIR, default ./transfers, overridable
+      by environment variable), the per-request cap is 256MB, and the
+      directory is refused with 507 once it exceeds 2GB.
+      Note this is a visible behaviour change: uploads no longer appear in
+      ~/Downloads, and a file must be placed in ./transfers for the client to
+      fetch it.
+      Verified: files land in the transfer directory, and the path check is
+      against that directory rather than the user's Downloads folder.
+    * BUG-24  Flask is threaded and pynput injects through the OS input queue,
+      so two requests could interleave SendInput calls. All device access now
+      goes through one lock. It is held only around individual calls - never
+      across a typing delay - so a slow typing job cannot block input.
+      Verified with a fake device that records concurrent entry: eight threads
+      pressing keys simultaneously never overlapped.
+
+  Verified
+    * Server suite: 53 checks pass, 7 fail - exactly the unfixed findings
+      BUG-25, BUG-26 and BUG-28.
+
+
+1.2  -  2026-10-06  -  Bugs 19-21 of 34: lost text, clobbered box, CSRF
+--------------------------------------------------------------------------------
+  Fixed
+    * BUG-19  The text box was cleared before the send was awaited, so a failed
+      request lost what the user had typed. The text is now put back when the
+      send fails, and never over something typed since.
+      Verified in Chromium with /text forced to answer 500: the box still held
+      the text afterwards and the toast reported the failure.
+    * BUG-20  "Copy" assigned the remote clipboard straight into the text box,
+      destroying anything the user was part-way through typing. It now only
+      fills an empty box; the clipboard copy itself always happens.
+      Verified: with "half typed" in the box, Copy reported the 21 characters
+      copied and left the box untouched.
+    * BUG-21  Nothing protected state-changing requests beyond SameSite=Lax,
+      and /download was a GET, which a cross-site navigation can still trigger
+      with the cookie attached. There is now a per-session token, issued by
+      GET /csrf, required on every mutating request as a header, a form field
+      or - for sendBeacon, which cannot set headers - a body field. /download
+      is POST-only.
+      Verified: POSTs without a token, with a wrong token, and GET /download
+      are all refused; a correct token is accepted.
+
+  Added
+    * The client fetches the token at startup, waits for it before its first
+      mutating request, and re-fetches and retries once if the server answers
+      403. That last part matters: a page left open while the session is
+      replaced elsewhere (a second login, for instance) would otherwise hold a
+      stale token and reject every keystroke. Found while testing this change,
+      not by inspection.
+      Verified: with the client's token deliberately corrupted, a keypress
+      still produced key_down/key_up and the token was refreshed.
+
+  Changed
+    * /logout now requires the token too, sent as a hidden form field since it
+      is a plain navigation.
+    * Downloading fetches the file and saves it from a blob rather than
+      navigating to a URL. The file is therefore held in memory, which is fine
+      for documents but not for very large files; noted in the code.
+
+  Verified
+    * Server suite: 49 checks pass, 8 fail - exactly the unfixed findings
+      BUG-23, BUG-25, BUG-26 and BUG-28.
+
+
+1.1  -  2026-10-06  -  Bugs 16-18 of 34: pre-load geometry, gestures, hidden tab
+--------------------------------------------------------------------------------
+  Fixed
+    * BUG-16  layout() ran at startup before any frame had decoded, so
+      naturalWidth fell back to 1 and fitBox() computed a roughly square
+      picture for the first frame, placing the image and the fake pointer
+      wrongly until the stream arrived. layout() now does nothing until the
+      first frame has decoded, and keeps the fake pointer hidden until then.
+      Verified in Chromium by sampling every 25ms through a page load: while
+      naturalWidth was 0 the cursor was hidden and no width had been applied;
+      once it read 640 the cursor became visible with the correct 560px box.
+    * BUG-17  Lifting one finger out of a multi-finger gesture left the pinch
+      baseline pointing at the old centroid, so the next move measured the
+      discontinuity as a large scroll. The gesture is now re-baselined whenever
+      the set of pointers changes.
+      Verified: with three fingers down, lifting the third left the centroid
+      and pinch distance identical, and the following small move produced no
+      scroll event at all.
+    * BUG-18  A coalesced pointer move is sent on the next animation frame,
+      which never fires while the tab is hidden, so the last position could be
+      delivered late or never. Becoming hidden now cancels the pending frame
+      and flushes the move immediately.
+      Verified: a queued move was still pending at the moment the page was
+      hidden and was sent immediately by the flush; the server log shows
+      exactly one POST /mouse for the whole session, which was that flush.
+
+  Verified
+    * All three are client-side; the server suite is unchanged from 1.0
+      (39 pass, 17 fail on the unfixed findings).
+
+
+1.0  -  2026-10-06  -  Bugs 13-15 of 34: trust, typing budget, session churn
+--------------------------------------------------------------------------------
+  Fixed
+    * BUG-13  The rate limiter keyed on CF-Connecting-IP unconditionally, so
+      any client that could reach the server without going through the tunnel
+      chose its own bucket and could not be locked out. The header is now
+      honoured only when the peer address is loopback, which is where
+      cloudflared connects from.
+      Verified: a request from a remote peer address is identified by its real
+      address even when it sends the header; a loopback peer still gets the
+      forwarded value.
+    * BUG-14  A single /text request could hold a worker thread for up to
+      10 000 x 0.5s, about 83 minutes, since only the length and the delay were
+      bounded, never their product. The job is now refused when
+      len(text) x delay would exceed 30 seconds.
+      Verified: a job that would run for 5s against a 0.5s budget is refused
+      with 400 and returns immediately instead of running to completion.
+    * BUG-15  Every mouse move went through stream_config(), which can write to
+      the session, so the hot input path emitted a Set-Cookie with every move
+      and swept the whole stream table under a lock each time. A read-only
+      peek_config() is now used there; nothing on the move path touches
+      session state or the stale sweep.
+      Verified: a move returns 204 and repositions the pointer with no
+      Set-Cookie header at all.
+
+  Verified
+    * Server suite: 39 checks pass, 17 fail, and the failures are exactly the
+      unfixed findings: BUG-21, BUG-23, BUG-25, BUG-26 and BUG-28.
+
+
+0.9  -  2026-10-06  -  Bugs 10-12 of 34: tab ARIA, 401 coverage, dotfile names
+--------------------------------------------------------------------------------
+  Fixed
+    * BUG-10  The tabs declared aria-selected on role="button" elements, which
+      is invalid, and reported null until the first click. The switcher is now
+      a real tab pattern: role="tablist" on the nav, role="tab" with
+      aria-selected, aria-controls and an id on each tab, and role="tabpanel"
+      with aria-labelledby on each panel, with the initial state declared in
+      the markup rather than created on first click.
+      Verified in Chromium: the initial state reads true/false/false with the
+      controls/labelledby wiring intact, and switching updates the selection.
+    * BUG-11  Only the JSON POST helper reacted to a 401, so loadMonitors(),
+      clipboard-get, upload and the latency poll all degraded into error
+      strings or silence when the session expired, with no way back to the
+      login page. Every request now goes through one guarded helper; the only
+      remaining bare fetch() is inside that helper.
+      Verified in Chromium: with the session cleared, the Copy button - which
+      previously showed "failed: unauthorized" and stayed put - now navigates
+      to /login.
+    * BUG-12  secure_filename() strips a leading dot, so uploading ".env" was
+      stored as "env" and the caller was handed back a different name than it
+      sent. A safe_name() helper keeps the leading dot while still reducing the
+      name to a bare basename.
+      Verified: ".env" stores as ".env", a second ".env" becomes ".env-1", and
+      "../../evil.txt" still reduces to "evil.txt".
+
+  Verified
+    * Server suite: 35 checks pass. Remaining failures are the unfixed
+      findings: BUG-13, 14, 15, 21, 23, 25, 26, 28, and BUG-30, whose check
+      currently passes for the wrong reason - it only asserts the -1 suffix,
+      not the atomicity of the collision test. That check will be strengthened
+      when BUG-30 is actually fixed.
+
+
+0.8  -  2026-10-06  -  Bugs 7-9 of 34: key ownership, stray releases, feedback
+--------------------------------------------------------------------------------
+  Fixed
+    * BUG-07  Keyboard state was process-global, so any client's release-all
+      (including logging out on a phone) dropped keys another client was
+      holding, and /logout released keys belonging to every session. Presses
+      are now owned by a per-session id, release-all is scoped to the caller,
+      and a key is only released when the last owner lets go.
+      Verified: client 2 calling /keys/release left client 1's held Control
+      alone; client 1's own release freed it. A key held by two sessions is
+      not released while either still holds it.
+    * BUG-08  A keyup whose id had never been seen still injected a release,
+      which could lift a key the host user was physically holding. A release
+      for an untracked id is now ignored unless that key was pressed by us
+      within the last 30s, which keeps the recover-after-a-reconnect case
+      working without releasing arbitrary keys.
+      Verified: an up for a never-seen key produces no event; an up for a key
+      pressed moments earlier is honoured; and an up from a different id can
+      no longer steal a key another id still holds.
+    * BUG-09  The virtual mouse buttons and the two scroll arrows never showed
+      a held state, and the .mbtn.active rule was dead CSS. They are now bound
+      as press/release like the keyboard keys, so they show the active
+      background and report aria-pressed while held.
+      Verified in Chromium: pointerdown applied "mbtn active", aria-pressed
+      "true" and the accent background; pointerup reverted it, and the click
+      and scroll still reached the server.
+
+  Changed
+    * /keys/release and /logout now affect only the calling session's keys.
+      A client that wants to clear the whole host can still tap the stuck key
+      or reload, but one client can no longer disturb another mid-chord.
+
+  Verified
+    * Server suite: BUG-07, BUG-08 and BUG-09 checks pass. Remaining failures
+      are exactly the unfixed findings: BUG-12, 13, 14, 15, 21, 23, 25, 26,
+      28 and 30.
+    * A BUG-08 check was rewritten after it failed for a correct reason: it
+      had expected a release from a different id while the original id still
+      held the key, which the BUG-07 rule deliberately prevents.
+
+
+0.7  -  2026-10-06  -  Bugs 4-6 of 34: touchpad state, Tab, duplicate releases
+--------------------------------------------------------------------------------
+  Fixed
+    * BUG-04  The touchpad pointer map leaked whenever a pointer never reported
+      pointerup - window blur or an app switch with fingers down. Once two
+      entries were stuck, pointerdown stopped setting the drag state and every
+      touch was read as scroll/pinch, so dragging the cursor stopped working
+      until the page was reloaded. releaseAllKeys() now also clears the pointer
+      map, the drag state and the pinch state, so blur, pagehide and becoming
+      hidden all reset the touchpad.
+      Verified in Chromium: two synthetic pointers down, then blur, left the
+      map at 2 entries before and 0 after, with the drag state null.
+    * BUG-05  Tab was in the forwarded key set and unconditionally
+      preventDefault()ed, so local focus navigation was impossible and the
+      tabindex/focus-visible work was unreachable by keyboard. Tab now belongs
+      to the browser: it is neither intercepted nor forwarded. Sending Tab to
+      the remote is still possible with the on-screen Tab key, which now has a
+      title explaining the split.
+      Verified: a real trusted Tab with #zoom-in focused moved focus to the
+      sign-out button and put nothing on the wire; clicking the on-screen Tab
+      key still sent key_down/key_up Key.tab.
+    * BUG-06  release_all_keys() emitted one release per source, so a key held
+      by two sources (both Shift buttons, or a button plus the real key) was
+      released twice. It now deduplicates by physical key first.
+
+  Verified
+    * Server suite: BUG-06 check passes. Remaining failures are the bugs not
+      yet fixed (BUG-07, BUG-08, BUG-12 to BUG-15, BUG-21, BUG-23, BUG-25,
+      BUG-28, BUG-30), each still reproducing as described in KNOWN_BUGS.txt.
+    * The BUG-25 check was strengthened after the first version passed for the
+      wrong reason: it now swaps a different display into the selected slot and
+      requires the selection not to follow it. It correctly fails today.
+    * The BUG-26 check was given a watchdog thread, because with the bug
+      present the frame generator retries internally and never returns from
+      next(), which hung the whole suite instead of failing one check.
+
+
+0.6  -  2026-10-06  -  Bugs 1-3 of 34: the three criticals
+--------------------------------------------------------------------------------
+  Fixed
+    * BUG-01  Enter or Space on any control bound with bindClick performed the
+      local action AND injected the same key into the remote host. The guard
+      that was supposed to prevent this keyed off aria-pressed, which only
+      bindPress sets, so every zoom button, tab, mouse button, stream preset,
+      typing preset, file button, host button, sign-out and clipboard button
+      leaked a keypress. Controls are now registered in an explicit
+      activationControls set when they are bound, by either helper, and the
+      document-level handler consults that set instead of an attribute.
+      Verified in Chromium: Enter on a focused #zoom-in still zoomed 100% ->
+      150% but put nothing on the wire; Enter on a focused tab likewise;
+      Enter on a focused virtual key still sent exactly key_down/key_up "z".
+    * BUG-02  An expired session left the UI on "reconnecting" forever with no
+      route back to the login page, because an <img> cannot report why it
+      failed and a 401 was indistinguishable from a dead tunnel. The stream
+      error handler now probes /ping: a dead tunnel fails the request and is
+      ignored, while an expired session answers 401 and the user is sent to
+      /login. All JSON requests now go through one guarded helper, so a 401
+      from anywhere redirects.
+      Verified in Chromium: with cookies cleared and the stream forced to
+      reload, the page navigated to /login within a few seconds. Previously it
+      stayed on / indefinitely.
+    * BUG-03  A client that only watched the screen lost its stream settings
+      permanently. frames() read its config but never refreshed the entry, and
+      /ping did not touch it, so after STREAM_TTL the stale sweep evicted the
+      token: the running stream silently fell back to 10 fps / quality 70, and
+      the session was issued a new token, so every later settings change went
+      somewhere the open stream would never read. The generator now refreshes
+      its own entry every frame, and /ping touches the config too.
+      Verified: with STREAM_TTL lowered to 0.05s, a stream producing frames
+      kept its token and its 5/45 settings across a stale sweep, and a client
+      that only polled /ping also kept its entry.
+
+  Added
+    * tests/server_check.py - regression suite. Runs the real server with the
+      keyboard, mouse, clipboard and capture stubbed, so it never moves the
+      real pointer or types on the real keyboard, and writes only inside a
+      temp directory. Each check names the bug it guards, so an unfixed bug
+      reports as a clean failure rather than a crash. Covers all 34 findings
+      plus the behaviours listed as verified-correct in KNOWN_BUGS.txt.
+    * .gitignore - excludes .env (the login password in plaintext), caches and
+      editor files.
+
+  Note
+    * First version under version control. The repository was initialised at
+      0.5 and every version from here is pushed to
+      https://github.com/chowl1306/rcfb.git
+
+
+0.5  -  2026-10-06  -  Version control introduced
+--------------------------------------------------------------------------------
+  Added
+    * CHANGELOGS.txt - this file. Establishes the versioning rule: two-part
+      `n.n`, incremented by exactly 0.1 per update, newest entry first, with
+      this file as the single source of truth for the version number.
+    * Entries for 0.1 to 0.3 were reconstructed retroactively from the state of
+      the source. 0.4 was the first number chosen at the time it was made, and
+      0.5 is this entry.
+
+  Changed
+    * Nothing. No source file is touched by this version.
+
+  Note
+    * A version is recorded even when only documentation changes, so the
+      numbering stays a faithful count of updates rather than of code changes.
+      Creating this file is itself an update, which is why it is 0.5 and not a
+      footnote to 0.4.
+
+  Verified
+    * Numbering checked against the history: 0.1 baseline, 0.2 hardening,
+      0.3 features, 0.4 audit, 0.5 changelog.
+
+
+0.4  -  2026-10-06  -  Bug audit, no code changes
+--------------------------------------------------------------------------------
+  Added
+    * KNOWN_BUGS.txt - 34 findings from a full read of server.py,
+      static/script.js, static/index.html and static/style.css.
+        13 confirmed by execution: Flask test_client against the real server
+        with stubbed keyboard/mouse/pyperclip devices, and real Chromium over
+        CDP against a stub server with synthetic frames.
+        21 marked [INFERENCE], from reading only, severity unproven.
+      Each entry records location, symptom, evidence, cause and a fix sketch,
+      followed by a list of 12 verified-correct behaviours to guard against
+      regressions, and a suggested fix order.
+
+  Changed
+    * Nothing. Every source file is identical to 0.3.
+
+  Note
+    * Version numbers 0.1 to 0.3 were assigned retroactively here. The project
+      had no version numbering before this entry; 0.4 is the first number that
+      was chosen at the time rather than reconstructed.
+
+  Verified
+    * Reproduced 13 defects by execution, including: Enter on a focused button
+      also typing Enter into the remote host; an expired session leaving the UI
+      stuck on "reconnecting" with no route to the login page; a passive viewer
+      silently losing its stream settings after 600 s; and the touchpad
+      pointer map leaking on blur so the touchpad sticks in gesture mode.
+    * Deliberately did NOT invoke host lock or Ctrl+Alt+Del - either would lock
+      the operator's own workstation. Those remain the only unexercised paths.
+
+
+0.3  -  2026-10-06  -  Feature pass: clipboard, files, monitors, gestures
+--------------------------------------------------------------------------------
+  Added
+    * server.py
+        /text            type a whole string in one request, optional
+                         per-character delay, control characters mapped to
+                         Enter/Tab/Backspace/Esc/Delete
+        /clipboard       GET and POST, via pyperclip
+        /upload          multipart upload into the host's Downloads folder,
+                         collisions get a -1 suffix, names sanitised
+        /download        serve one file from the Downloads folder by name
+        /monitors        list monitors, ?refresh=1 to re-enumerate
+        /monitor         choose the monitor the stream and mouse use
+        /stream-settings fps / quality / scale for the open stream
+        /special         host lock, Ctrl+Alt+Del (SendSAS)
+        /ping            204, for the latency readout
+        /keys/release    release every held key
+        Per-client stream config keyed by a token in the session, so quality,
+        fps, scale and monitor can change without reconnecting the stream.
+        Monitor enumeration cached with a 5 s TTL, so hot-plugging, docking and
+        resolution changes are picked up without restarting the server.
+        frames(): survives a transient grab failure instead of ending the
+        stream, and optionally downscales before JPEG encoding.
+        Uploads capped at 512 MB.
+    * static/index.html
+        Third "system" tab: monitor picker, stream presets, typing speed,
+        file send/get, host lock and Ctrl+Alt+Del.
+        Paste / Copy clipboard buttons beside the text box.
+        Drop hint overlay on the screen area.
+        Latency readout in the top bar.
+        All 83 virtual-key elements given role="button" and tabindex="0";
+        the two Shift keys, both Ctrl, both Alt and both Meta keys given
+        distinct ids so they are tracked separately.
+    * static/script.js
+        File transfer by drag-and-drop onto the screen area.
+        Touchpad two-finger scroll and pinch-to-zoom, alongside the existing
+        drag-to-move and tap-to-click.
+        Camera-follow: a pan offset that keeps the remote cursor centred while
+        zoomed, clamped so the picture never pulls away from the viewport edge.
+        Zoom anchored on the remote cursor, so zooming in keeps the pointer put.
+        Stream auto-reconnect with exponential backoff (500 ms doubling to a
+        10 s cap, counter reset on a successful load).
+        Stuck-key guard: releases every held key on blur, pagehide and when the
+        tab becomes hidden, via sendBeacon with a keepalive fetch fallback.
+        One bindPress/bindClick helper drives pointer, keyboard and ARIA state
+        for every control, so nothing is pointer-only.
+    * Dependencies: pyperclip (requirements.txt and the start.bat import probe).
+
+  Changed
+    * Geometry rewritten. The screen rectangle is now set from JavaScript
+      (left/top/width/height) and visibleBox() is the single source of truth
+      for the viewport-to-remote mapping. #screen-wrap now has an explicit
+      height instead of deriving it from the image's layout.
+    * Keyboard presses are tracked per source id, so the two Shift buttons are
+      independent and a key is released only when the last holder lets go.
+    * Every non-static response sends Cache-Control: no-store.
+    * Mouse moves are coalesced to at most one request per animation frame.
+    * The text box now sends one /text request instead of one round-trip per
+      character.
+
+  Fixed
+    * Scroll was about 100x too strong. Client values went straight to
+      pynput, which multiplies by WHEEL_DELTA (120). The contract is now
+      signed notches, positive meaning "scroll up", on both sides.
+    * The on-screen scroll arrows were inverted and hardcoded -120/+120.
+    * A newline in the text box was sent as a literal character rather than
+      pressing Enter; tab likewise.
+    * Both Shift keys released together.
+    * Top-level moveTo() and scrollBy() silently shadowed window.moveTo and
+      window.scrollBy; renamed to moveCursor and scrollRemote.
+    * Enter or Space on a focused virtual key also leaked a keypress to the
+      remote. A guard was added; it remains incomplete for controls bound with
+      bindClick, recorded as BUG-01 in 0.4.
+    * Mouse coordinates are clamped server-side.
+    * Monitor geometry was cached for the lifetime of the process.
+    * Enter/Space on a focused control could not be distinguished from a
+      remote keypress at all.
+
+  Removed
+    * The CSS transform zoom and its transform-origin, superseded by the
+      JS-driven geometry (one representation instead of two).
+    * primary_monitor()'s permanent cache, replaced by the TTL enumeration.
+
+  Verified
+    * 69 server assertions against the real app with stubbed devices, plus
+      real-mss capture confirming the JPEG pipeline, that scale shrinks the
+      frame and that quality shrinks it.
+    * In Chromium: a click at viewport (298,368) landed at remote pixel
+      (160,360) = (0.25,0.75) of a 640x480 monitor; at 225% zoom the picture
+      clamped flush to the viewport edge with no black gap; retries measured at
+      502 / 1004 / 2007 ms before returning to "connected"; preset change took
+      effect on the open stream (640x480 -> 320x240); upload landed
+      byte-identical; drop-to-remote worked; download returned 200 and
+      traversal returned 400; holding a virtual key then blurring produced a
+      key_up and cleared all aria-pressed state.
+
+
+0.2  -  2026-10-06  -  Hardening pass: throttling, logout, input fixes
+--------------------------------------------------------------------------------
+  Added
+    * Login rate limiting: 8 failures within 300 s lock the client out, keyed
+      on CF-Connecting-IP with a remote_addr fallback, since cloudflared
+      connects from loopback and would otherwise share one bucket.
+    * /logout, and a "Sign out" control in the top bar.
+    * Lockout message on the login page, distinct from "invalid credentials".
+    * A 401 from the JSON helper redirects to /login, so an expired session no
+      longer swallows input silently.
+
+  Changed
+    * Session cookie is HttpOnly and SameSite=Lax.
+    * A successful login clears the session before granting access.
+
+  Fixed
+    * One mouse move per mousemove event -> coalesced to one per animation
+      frame; a 60-move burst now produces one request.
+    * Key auto-repeat sent a down event every ~30 ms while a key was held;
+      event.repeat is now ignored.
+    * Browser wheel deltas are converted to signed notches with a remainder
+      accumulator (100 px per notch, line-mode deltas handled), so trackpad
+      micro-deltas still accumulate to a notch.
+    * Mouse coordinates outside 0..1 were sent to the server unchecked.
+
+  Verified
+    * Login throttle including rejection of the correct password while locked,
+      per-IP accounting, and clearing on success.
+    * Coordinate clamping, wheel direction, coalescing, auto-repeat suppression,
+      logout invalidating the session, and the 401 redirect.
+
+
+0.1  -  baseline (pre-audit, no version number existed)
+--------------------------------------------------------------------------------
+  Baseline as first read. Recorded here for reference; the number is
+  retroactive.
+
+  * Flask app serving a password-gated MJPEG screen stream, capturing with mss
+    and encoding with Pillow, with keyboard and mouse injection through pynput.
+  * Password read from .env, single fixed username, session-based auth.
+  * Browser UI: screen view with zoom buttons, an on-screen keyboard, a
+    touchpad with drag-to-move and tap-to-click, mouse buttons, a text box,
+    and a fake cursor drawn over the stream.
+  * start.bat: dependency check, server launch, cloudflared quick tunnel.
+  * Known-bad at this point, all fixed in 0.2 and 0.3: scroll magnitude and
+    direction, on-screen arrow inversion, unthrottled login, no logout,
+    mouse-move flooding, key auto-repeat flooding, no stream reconnect,
+    monitor geometry cached forever, no frame-error handling, no batch text,
+    no clipboard, no file transfer, no monitor picker, no quality control.
+
+
+Pending
+-------
+Nothing. All 34 findings in KNOWN_BUGS.txt are fixed, across 1.7 versions of
+work from 0.6 to 1.7.
+
+  Fixed : BUG-01..03 (0.6), BUG-04..06 (0.7), BUG-07..09 (0.8),
+          BUG-10..12 (0.9), BUG-13..15 (1.0), BUG-16..18 (1.1),
+          BUG-19..21 (1.2), BUG-22..24 (1.3), BUG-25..27 (1.4),
+          BUG-28..30 (1.5), BUG-31..33 (1.6), BUG-34 (1.7)
+
+  Server suite: tests/server_check.py, 64 checks, all passing.
+
+  Known limits, stated rather than hidden:
+    * BUG-27's two host-power actions (lock, Ctrl+Alt+Del) are the only code
+      paths never executed, because running either would lock this machine.
+      Their confirmation prompt is verified as wiring only.
+    * BUG-31's touch feel was verified as applied CSS, not as a real gesture;
+      the harness has no touchscreen.
+    * BUG-32's guard was verified by calling it directly, because this
+      harness freezes page timers, so the interval itself could not be timed.
+    * Downloading buffers the whole file in memory, since the endpoint had to
+      become POST to close the CSRF hole.

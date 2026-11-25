@@ -1,0 +1,521 @@
+KNOWN_BUGS
+==========
+
+STATUS: RESOLVED. All 34 findings below are fixed, from version 0.6 to 1.7.
+This file is kept as the record of what was wrong and how it was found; the
+changelog records what each fix did.
+
+A second audit, run for version 2.0, found 18 further defects across server.py,
+rcfb_cli.py and static/script.js. It is recorded in CHANGELOGS.txt under 2.0 as
+AUDIT-01..AUDIT-11 (server), CLI-01..CLI-07 and WEB-01, and the server-side
+ones are guarded by the AUDIT section of tests/server_check.py. None of the 34
+findings below was reopened by it.
+
+Resolution index
+----------------
+  0.6   BUG-01  Enter/Space on a focusable control also reached the remote
+        BUG-02  expired session left the UI stuck on "reconnecting"
+        BUG-03  a passive viewer silently lost its stream settings
+  0.7   BUG-04  touchpad pointer map leaked, sticking it in gesture mode
+        BUG-05  Tab was swallowed, so local focus navigation did not work
+        BUG-06  release_all_keys() double-released a shared key
+  0.8   BUG-07  keyboard state was global across sessions
+        BUG-08  a stray keyup injected a release
+        BUG-09  mouse buttons had no held state; .mbtn.active was dead CSS
+  0.9   BUG-10  tabs used invalid ARIA and reported null until first click
+        BUG-11  only one request path handled a 401
+        BUG-12  secure_filename() renamed dotfiles on upload
+  1.0   BUG-13  the rate limiter trusted a client-supplied header
+        BUG-14  one /text request could hold a thread for ~83 minutes
+        BUG-15  every mouse move rewrote the session cookie
+  1.1   BUG-16  layout ran before the first frame, using a bogus box
+        BUG-17  lifting a finger mid-gesture produced a spurious scroll
+        BUG-18  a coalesced move was lost when the tab was hidden
+  1.2   BUG-19  text was lost when a send failed
+        BUG-20  "Copy" overwrote the text box
+        BUG-21  no CSRF protection; /download was a GET
+  1.3   BUG-22  the session cookie was never Secure
+        BUG-23  uploads went to the real ~/Downloads with no quota
+        BUG-24  concurrent device access was unsynchronised
+  1.4   BUG-25  monitor selection was a bare index
+        BUG-26  a permanent capture failure degraded silently
+        BUG-27  host lock / Ctrl+Alt+Del had no confirmation
+  1.5   BUG-28  the login-failure table grew without bound
+        BUG-29  fps of 0 raised ZeroDivisionError in the frame loop
+        BUG-30  upload naming was check-then-act
+  1.6   BUG-31  nested scroll containers chained into each other
+        BUG-32  the latency poll ran while the tab was hidden
+        BUG-33  a silently dropped stream was never retried on return
+  1.7   BUG-34  wheel and touchpad shared one scroll accumulator
+
+Regression suite: tests/server_check.py, 64 checks, all passing. It runs the
+real server with the devices, clipboard and capture stubbed, so it never moves
+the real pointer, types on the real keyboard or touches the real clipboard.
+
+Not reproduced before fixing: BUG-27's two host-power actions, because running
+either would lock this machine. Their fix is verified as wiring only. See the
+changelog's 1.7 entry for the other stated limits.
+
+
+Audit of rcfb (server.py, static/script.js, static/index.html, static/style.css),
+produced before any fix attempt. Nothing in the repository has been changed by
+this audit.
+
+How findings were produced
+--------------------------
+Every entry marked CONFIRMED was reproduced by execution, not by reading:
+
+  * Server: Flask test_client against real server.py with stubbed
+    keyboard/mouse/pyperclip devices (no real input injected, clipboard
+    untouched), plus real-mss capture where relevant.
+  * Client: real Chromium against a stub server (stubbed devices + synthetic
+    frames) driven over CDP.
+
+Entries marked [INFERENCE] come from reading the source only. They are real
+code paths but were not executed; treat their severity as unproven.
+
+Severity legend
+---------------
+  CRITICAL  silently breaks the product for a normal user
+  HIGH      user-visible malfunction or a security boundary that leaks
+  MEDIUM    wrong behaviour in a narrower case, or an operational hazard
+  LOW       cosmetic, accessibility nit, or robustness hardening
+
+Line numbers refer to the files as they are now.
+
+
+================================================================================
+1. CONFIRMED DEFECTS
+================================================================================
+
+BUG-01  CRITICAL  Every Enter/Space on a keyboard-focused control is also sent
+                 to the remote host.
+  Where   static/script.js:449 (bindClick), :346-356 (document keydown/keyup),
+          :369 (activatingControl)
+  Symptom Pressing Enter on a focused button performs the local action AND
+          injects a keystroke into the remote machine. On a remote desktop a
+          stray Enter confirms dialogs, submits forms, sends chat messages.
+  Evidence Focused #zoom-in, dispatched Enter: zoom went 100% -> 150% and the
+          device log recorded key_down/key_up Key.enter. Same for
+          .tab[data-panel=system]. Space on .mbtn[data-button=left] produced
+          click Button.left AND key_down/key_up Key.space.
+  Cause   activatingControl() only skips events whose target carries
+          aria-pressed. bindPress() sets aria-pressed, so virtual keys are
+          exempt, but bindClick() controls never set it. Affected controls:
+          zoom in/out/label, all .tab, all .mbtn (buttons and scroll arrows),
+          stream presets, typing presets, #file-send, #file-get, #host-lock,
+          #host-cad, #logout, #text-send, #clipboard-send, #clipboard-get.
+  Fix     Make the exclusion structural rather than attribute-based: have
+          bindClick mark its elements (e.g. a shared WeakSet or a
+          data attribute) and have activatingControl consult that; or have
+          bindClick call event.preventDefault() plus stopPropagation in a
+          capture-phase listener.
+
+BUG-02  CRITICAL  An expired session leaves the UI stuck on "reconnecting"
+                 forever, with no path back to the login page.
+  Where   static/script.js:256 (screenImage error handler), :242 (openStream)
+  Symptom The screen stream starts returning 401 after the session cookie
+          expires (server restart, cookie cleared, long idle). The <img> fires
+          error, the client retries with exponential backoff up to 10 s
+          forever. The page never redirects. Only a manual reload recovers.
+  Evidence Cleared cookies, forced screenImage.src: after 4 s the URL was
+          still "/", status text "reconnecting", latency still showing its
+          empty placeholder (/ping also 401).
+  Cause   The error handler treats every failure as transient. It cannot see
+          the HTTP status of an <img> load, so 401 is indistinguishable from a
+          dead tunnel.
+  Fix     Treat 401 as terminal: probe with fetch("/ping") when the error
+          handler fires (or when the retry counter exceeds a small threshold)
+          and redirect to /login on 401. Optionally give up after N attempts.
+
+BUG-03  CRITICAL  A live stream silently loses its chosen settings, permanently.
+  Where   server.py:239-252 (stream_config), :258 (frames), :44 (STREAM_TTL)
+  Symptom A client that only watches the screen makes no request which touches
+          its stream config. After STREAM_TTL (600 s) the next unrelated
+          request performs the stale sweep, the token is evicted, and:
+            (a) the running generator falls back to DEFAULT_STREAM, so the
+                user's fps/quality/scale silently reset to 10/70/1.0, and
+            (b) session["stream"] is replaced by a NEW token, so every later
+                /stream-settings write goes to the new token and the already
+                open stream can never be reconfigured again. Only reloading
+                the page fixes it.
+  Evidence With STREAM_TTL=0.05: set 5/45/0.5 -> waited -> GET /monitors ->
+          token 5b7919... became df02a6..., old token absent from _streams, and
+          the generator bound to the old token saw fps=10 quality=70.
+  Cause   frames() reads _streams[token] but never refreshes its "touched"
+          timestamp, and /ping does not call stream_config(), so a passive
+          viewer never keeps its own entry alive.
+  Fix     Refresh "touched" from inside the generator loop (under the lock),
+          and/or drop optimistic eviction in favour of evicting only tokens
+          whose session has gone away. Also make /ping touch the config.
+
+BUG-04  HIGH  Touchpad pointer state leaks; the touchpad becomes permanently
+               stuck in two-finger gesture mode.
+  Where   static/script.js:597-700 (pointers map, pointerdown/move, endPointer),
+          :323 (releaseAllKeys does not reset pointers)
+  Symptom If a pointer never delivers pointerup/pointercancel - window blur or
+          app switch with fingers down, an interrupted touch, some mobile
+          browsers - the entry stays in `pointers` forever. Once size >= 2,
+          pointerdown never sets padDrag and pointermove always takes the
+          gesture branch, so single-finger drag stops moving the cursor and
+          every touch is interpreted as scroll/pinch.
+  Evidence After two synthetic pointerdowns followed by window blur (no
+          pointerup), `pointers.size === 2` persisted. A following single-
+          finger drag then made size 3 and padDrag stayed null.
+  Cause   No reconciliation of pointers on blur/visibilitychange, and no
+          timeout/staleness check.
+  Fix     Clear `pointers`, `padDrag` and `pinch` from releaseAllKeys() (and
+          thus from blur/pagehide/visibilitychange). Consider also dropping
+          entries that have not moved for N seconds.
+
+BUG-05  HIGH  Tab is swallowed, so local keyboard focus navigation does not
+               work at all.
+  Where   static/script.js:17 (SCROLL_KEYS contains "Tab"), :374-392
+  Symptom Tab and Shift+Tab are preventDefault()ed and forwarded to the remote
+          as a keypress, so the user can never Tab between the zoom controls,
+          tabs, sign-out button or system panel. The focus-visible styling and
+          tabindex="0" added to ~56 controls are only reachable by clicking.
+  Evidence A real trusted Tab keypress with #zoom-in focused left
+          document.activeElement as #zoom-in.
+  Cause   Tab is in SCROLL_KEYS (added so Tab can be sent to the remote), and
+          the handler unconditionally preventDefault()s every key in that set.
+  Fix     Choose one: (a) only preventDefault Tab when the event target is not
+          a local focusable control, (b) add a modifier-based escape hatch
+          (e.g. send Tab to the remote only with Ctrl held), or (c) provide an
+          explicit "release keyboard to the browser" toggle. Whatever is
+          chosen, document it - this is a deliberate trade-off, not an
+          accident, but currently it is undocumented and breaks the a11y work.
+
+BUG-06  MEDIUM  release_all_keys() sends duplicate releases.
+  Where   server.py:189
+  Symptom If two source ids hold the same physical key (e.g. both Shift
+          buttons, or the left Shift button plus the physical ShiftLeft), the
+          key appears twice in _pressed.values(), so /keys/release calls
+          keyboard.release() twice for it.
+  Evidence Two Shift holders -> /keys/release -> 2 release calls.
+  Cause   keys = list(_pressed.values()) is not deduplicated.
+  Fix     Deduplicate before releasing, e.g. iterate over unique ids/keys
+          using the same identity comparison used by key_down/key_up.
+
+BUG-07  MEDIUM  Keyboard state is global, so one client releases another
+                client's held keys.
+  Where   server.py:160-196 (_pressed, no session scoping),
+          server.py:347 (/logout calls release_all_keys)
+  Symptom Two devices (phone + laptop) connected at once share `_pressed`.
+          Logging out on one, or any blur/release-all on one, releases keys
+          physically held via the other. Also, if client A holds Ctrl while
+          client B does anything that triggers a release-all, A's Ctrl is
+          dropped mid-chord.
+  Evidence Client 1 pressed Control; client 2 POSTed /keys/release; the device
+          log showed ('up', Key.ctrl) even though client 1 still held it.
+  Cause   _pressed is process-global with no notion of which session owns a
+          press.
+  Fix     Key _pressed by (session_id, ident), and scope /keys/release and
+          /logout to the calling session. Keep a global sweep on shutdown.
+
+BUG-08  LOW  A stray keyup emits a release with no matching press.
+  Where   server.py:180-187
+  Symptom Any "up" whose ident was never seen (server restarted, stale tab
+          restored from bfcache) calls keyboard.release() for a key that was
+          never pressed. Harmless in practice but it injects an event, and it
+          can release a key the host user is physically holding.
+  Evidence {"event":"up","key":"a","id":"never-pressed"} -> [('up','a')].
+  Cause   Intentional fallback for the post-restart case; the fallback is
+          unconditional, with no notion of "recently pressed".
+  Fix     Keep the fallback but gate it on a short recently-pressed memory, or
+          accept it and document it.
+
+BUG-09  LOW  Mouse buttons give no visual feedback; the .mbtn.active rule is
+              dead CSS.
+  Where   static/style.css:290 (.mbtn.active), static/script.js:707
+  Symptom The virtual mouse buttons and the two scroll arrows never change
+          appearance while pressed. The scroll arrows also have no auto-repeat,
+          so one press equals exactly one notch.
+  Evidence During pointerdown on .mbtn[data-button=left] the className stayed
+          "mbtn" and aria-pressed was null.
+  Cause   After the accessibility rewrite these elements went through
+          bindClick(), which only invokes an action; the old
+          classList.add("active") was dropped, and .mbtn was never given
+          aria-pressed.
+  Fix     Bind them with bindPress (add/release semantics) or add explicit
+          active-state handling; delete the rule if the behaviour is unwanted.
+
+BUG-10  LOW  Tabs have no ARIA state, and use an attribute that is invalid on
+              their role.
+  Where   static/index.html (#tabs / .tab), static/script.js:466
+  Symptom All .tab elements report aria-selected = null until the first click
+          sets it. The container has no role="tablist" and the tabs are
+          role="button", so aria-selected is not a valid attribute for them.
+  Evidence Initial state: [["keyboard",null],["mouse",null],["system",null]].
+  Cause   ARIA added ad hoc in the click handler; markup never updated.
+  Fix     Either adopt the real tab pattern (role="tablist"/"tab"/"tabpanel"
+          with aria-selected initialised in HTML) or drop aria-selected and
+          use aria-pressed on the buttons.
+
+BUG-11  MEDIUM  401 is handled in exactly one place, so most session-expiry
+                paths degrade into error strings instead of a redirect.
+  Where   static/script.js:52 (post() redirects), but loadMonitors :725,
+          #clipboard-get :578, uploadFiles and #file-get use bare fetch().
+  Symptom Session expires -> the user gets "failed: unauthorized",
+          "monitor list failed: 401" or a silent no-op instead of being sent
+          to the login page. Combined with BUG-02, there is no recovery path.
+  Evidence With cookies cleared: /clipboard -> 401 UNAUTHORIZED, /monitors ->
+          401, /screen -> 401.
+  Cause   The 401 check lives inside post() only.
+  Fix     Route every authenticated request through one helper that performs
+          the redirect (or wrap them in a shared guarded fetch).
+
+BUG-12  LOW  secure_filename() silently renames dotfiles on upload.
+  Where   server.py:534-545
+  Symptom Uploading ".env", ".gitignore" or ".bashrc" saves them as "env",
+          "gitignore", "bashrc". The remote path reported back does not match
+          what the user sent.
+  Evidence secure_filename(".env") -> 'env'.
+  Cause   Werkzeug strips leading dots.
+  Fix     Use the sanitised name only as a fallback; if secure_filename
+          changes the name, keep the original basename after removing path
+          separators, or tell the client the name changed.
+
+BUG-13  MEDIUM  Login throttling trusts a client-supplied header.
+  Where   server.py:136 (client_ip)
+  Symptom The rate limiter keys on CF-Connecting-IP with no verification. Any
+          client that can reach the server directly can send a different value
+          per attempt and never be locked out. Behind cloudflared this is
+          largely moot (cloudflared overwrites the header), but it is a real
+          hole if the port is exposed on a LAN or by a different tunnel.
+  Evidence The header took precedence over remote_addr in client_ip().
+  Cause   Forwarded-header trust without an allow-list of upstream proxies.
+  Fix     Only honour the header when request.remote_addr is a trusted
+          loopback/proxy address (it is today) and document the assumption;
+          also cap the _login_failures map size to bound memory under
+          spoofed keys.
+
+
+================================================================================
+2. STATIC-ANALYSIS FINDINGS (not executed)
+================================================================================
+
+BUG-14  MEDIUM  [INFERENCE] One /text request can occupy a worker thread for
+                over an hour.
+  Where   server.py:445-468
+  Cause   The loop sleeps `delay` per character with delay up to 0.5 s and text
+          up to 10 000 characters: 10 000 x 0.5 = 5000 s, about 83 minutes in a
+          single request. Several such requests would exhaust the thread pool
+          and starve the screen stream and input.
+  Fix     Cap total wall time (or the length/delay product), stream progress,
+          or make slow typing cancellable.
+
+BUG-15  MEDIUM  [INFERENCE] Every mouse move mutates the session cookie and
+                scans the whole stream table.
+  Where   server.py:239-252 via current_monitor() at :470
+  Cause   current_monitor() calls stream_config(), which takes _streams_lock,
+          sweeps every entry, and may write session["stream"]. Called on every
+          /mouse request, this adds a lock, an O(n) scan and a Set-Cookie
+          header to a path that runs up to ~60 times per second.
+  Fix     Cache the resolved monitor per stream token, and only touch the
+          session when the token is actually created or changed.
+
+BUG-16  LOW  [INFERENCE] Wrong geometry flash before the first frame arrives.
+  Where   static/script.js:135 (naturalWidth || 1)
+  Cause   Before the image loads, naturalWidth is 0, coerced to 1, so fitBox()
+          computes a roughly square box from the wrap height. layout() runs at
+          init with this bogus box, then corrects on load.
+  Fix     Skip layout() until naturalWidth > 0.
+
+BUG-17  LOW  [INFERENCE] Three or more fingers produce spurious scroll.
+  Where   static/script.js:604-618 (gestureState uses only the first two
+          entries), :630
+  Cause   With 3+ pointers the centroid is computed from two of them, so the
+          third finger changes the centroid and is interpreted as movement.
+  Fix     Ignore additional pointers, or compute the centroid over all
+          active pointers.
+
+BUG-18  LOW  [INFERENCE] A pending pointer move can be dropped.
+  Where   static/script.js:196-215 (rAF-coalesced flushMove)
+  Cause   If the page is hidden, requestAnimationFrame does not fire, so
+          pendingMove is never sent. On becoming visible a stale position may
+          be flushed later.
+  Fix     Flush (or discard) pendingMove in the visibilitychange handler.
+
+BUG-19  LOW  [INFERENCE] Text is lost when a send fails.
+  Where   static/script.js:552-566
+  Cause   The input is cleared synchronously before awaiting the request; on a
+          network error or 401, the user's text is gone.
+  Fix     Restore the text into the input on failure.
+
+BUG-20  LOW  [INFERENCE] "Copy" clobbers whatever is in the text box.
+  Where   static/script.js:578-593
+  Cause   clipboard-get assigns textInput.value unconditionally.
+  Fix     Only fill the box when it is empty, or label the button as the way to
+          load it.
+
+BUG-21  LOW  [INFERENCE] No CSRF token; SameSite=Lax is the only defence.
+  Where   server.py:68, all state-changing POSTs
+  Cause   Lax blocks cookies on cross-site POST, which covers the dangerous
+          verbs, but top-level cross-site GET navigations still carry the
+          cookie - /download is a GET that hands a file to any site that can
+          navigate the browser to that URL. Severity is low because the data
+          belongs to the same user, but the design relies on a browser default.
+  Fix     Send a per-session token with state-changing requests, or make
+          /download POST-only.
+
+BUG-22  MEDIUM  [INFERENCE] Session cookie has no Secure flag.
+  Where   server.py:67-68
+  Cause   Only HttpOnly and SameSite are set. Over the https tunnel the cookie
+          would benefit from Secure; it is omitted because the app is also used
+          at http://127.0.0.1:6767, where Secure would break login.
+  Fix     Set Secure when the request arrives over https (or behind the
+          tunnel), or split local and tunnel access.
+
+BUG-23  MEDIUM  [INFERENCE] ~/Downloads is wholesale exposed and is the upload
+                target, with no quota.
+  Where   server.py:534-559, MAX_CONTENT_LENGTH at :69
+  Cause   /download can read any single file in the user's Downloads folder by
+          name, and /upload will accept up to 512 MB per request with no
+          disk-space check. Traversal is correctly blocked (verified), but the
+          blast radius of a compromised session is the whole folder plus
+          unbounded disk writes.
+  Fix     Use a dedicated rcfb directory or confine transfers to a chosen
+          subfolder; add a per-request and total size cap.
+
+BUG-24  LOW  [INFERENCE] Concurrent pynput controller use is unsynchronised.
+  Where   server.py:71-72, called from /keyboard, /text, /mouse, /special
+  Cause   Flask runs threaded; several threads may call keyboard.press/release
+          and mouse operations simultaneously. SendInput injection from
+          multiple threads can interleave, producing reordered or dropped
+          events for simultaneous clients.
+  Fix     Serialise device access behind a single lock.
+
+BUG-25  LOW  [INFERENCE] Monitor selection drifts when a display is unplugged.
+  Where   server.py:225-232, :470-482
+  Cause   config["monitor"] is an index into a list that changes. If monitor 2
+          is unplugged, index 1 now refers to a different physical display and
+          the stream silently follows it, while /monitors reports a clamped
+          index that was never written back.
+  Fix     Prefer a stable key (position/size) over a bare index, or reset the
+          selection and tell the client when the list changes.
+
+BUG-26  LOW  [INFERENCE] A permanent capture failure degrades silently.
+  Where   server.py:258-306
+  Cause   If mss cannot ever produce the selected monitor, frames() loops on
+          sleep(0.5) forever and /mouse returns 503. The client shows
+          "connected" with a blank image and no explanation.
+  Fix     Surface a stream error to the client (e.g. a short 503 with a
+          readable body, or an X-Header) and show it in the status line.
+
+BUG-27  LOW  [INFERENCE] Host lock / Ctrl+Alt+Del have no confirmation, and
+                Ctrl+Alt+Del is expected to fail.
+  Where   server.py:561-585, static/script.js:840-850
+  Cause   Both act on a single click with no confirm; LockWorkStation succeeds
+          immediately, and SendSAS normally returns 501 on a non-service
+          process, so "Ctrl+Alt+Del" will usually report a failure.
+  Note    These two paths were deliberately NOT executed during this audit -
+          either call would lock the operator's own workstation. They remain
+          the only unexercised code in the project.
+
+BUG-28  LOW  [INFERENCE] Rate-limit state is in-memory and unbounded.
+  Where   server.py:130-156
+  Cause   A restart clears all lockouts (also noted in the previous review),
+          and although per-key timestamps are pruned on read, the key set
+          itself is never pruned, so many distinct forged CF-Connecting-IP
+          values grow the dict without limit.
+  Fix     Periodically drop empty/expired keys and cap the dict size.
+
+BUG-29  LOW  [INFERENCE] fps of 0 would kill the stream with ZeroDivisionError.
+  Where   server.py:305
+  Cause   1.0 / fps has no guard. fps is clamped to >= 1 by /stream-settings,
+          so this is only reachable if the config dict is otherwise corrupted;
+          the exception would propagate out of frames() and end the stream.
+  Fix     Guard with max(1, fps) at use.
+
+BUG-30  LOW  [INFERENCE] Upload name collision check is not atomic.
+  Where   server.py:540-548
+  Cause   The exists() / save() pair is a check-then-act race; two concurrent
+          uploads of the same filename can target the same path, and the
+          second overwrites the first.
+  Fix     Open with an exclusive create (O_CREAT|O_EXCL) and retry on
+          collision.
+
+BUG-31  LOW  [INFERENCE] Nested scroll containers on touch devices.
+  Where   static/style.css (.panel { overflow-y: auto } plus .row.scroll
+          { overflow-x: auto })
+  Cause   The keyboard panel scrolls vertically while individual key rows
+          scroll horizontally; on a phone this produces awkward gesture
+          conflicts and a bottom row that can be hard to reach.
+  Fix     Verify on a real handset; consider sizing rows to fit instead of
+          nesting two scrollers.
+
+BUG-32  LOW  [INFERENCE] Latency polling continues while the page is hidden.
+  Where   static/script.js:895 (setInterval(checkLatency, 5000))
+  Cause   The interval is never suspended on visibilitychange, so a backgrounded
+          tab keeps a request every 5 s, waking the radio on mobile.
+  Fix     Pause the interval while document.hidden.
+
+BUG-33  LOW  [INFERENCE] A stale-but-not-errored stream never reconnects when
+                the page becomes visible again.
+  Where   static/script.js:350-355
+  Cause   The visibilitychange handler only reopens the stream when the status
+          text is not "connected". If the browser silently dropped the
+          connection without firing error (common when backgrounding on
+          mobile), the status still says "connected" and nothing is retried.
+  Fix     Track the timestamp of the last frame (e.g. via the natural-size poll
+          or a periodic check) and force a reopen on becoming visible when the
+          stream looks stale.
+
+BUG-34  LOW  [INFERENCE] Mouse wheel and two-finger scroll share one
+                accumulator.
+  Where   static/script.js:219-227 (wheelRemainder), used by both the wheel
+          handler :283 and the pinch/scroll handler :630
+  Cause   A sub-notch remainder left by a mouse wheel is carried into the next
+          two-finger gesture (and vice versa), which can produce one stray
+          notch.
+  Fix     Keep separate accumulators per input source.
+
+
+================================================================================
+3. VERIFIED CORRECT (regression guards)
+================================================================================
+
+These were exercised during this audit and behaved correctly. Any fix for the
+entries above must keep them working.
+
+  * Login lockout: 8 failures within the window lock the IP, and the correct
+    password is still refused while locked; a successful login clears the IP.
+  * Key hold accounting: duplicate press for the same id sends one press; a
+    release frees the key; two Shift ids press once and release only when the
+    last holder lets go.
+  * Control characters: "\n" -> Enter, "\t" -> Tab (this was a real bug, fixed
+    in the previous pass).
+  * Scroll contract: signed notches, positive = up; image wheel down -> dy -1.
+  * Coordinate mapping: a click at viewport (298,368) landed at remote pixel
+    (160,360) = (0.25,0.75) of a 640x480 monitor.
+  * Camera-follow: zoom clamps the picture flush to the viewport edge
+    (right=900, bottom=456) with no black gap at 225%.
+  * Stream reconnect backoff: measured retries at 502 / 1004 / 2007 ms, then a
+    clean return to "connected".
+  * Stuck keys: holding a virtual key and blurring produced key_up on the
+    server and cleared all aria-pressed state.
+  * /download traversal: "../server.py", "a/b", "..%5Cx" all rejected with 400.
+  * Upload: file lands byte-identical, collisions get a -1 suffix, names are
+    sanitised.
+  * Live stream settings: preset change took effect on the open stream without
+    reconnecting (640x480 -> 320x240).
+  * no-store on /, /login and all dynamic endpoints; static assets still
+    cacheable.
+
+
+================================================================================
+4. SUGGESTED FIX ORDER
+================================================================================
+
+  1. BUG-01, BUG-02  - both break the product for a normal user.
+  2. BUG-03, BUG-04  - silent data/state loss that is hard to diagnose.
+  3. BUG-05, BUG-11  - recoverability and accessibility.
+  4. BUG-06, BUG-07, BUG-13, BUG-14 - correctness and resource safety.
+  5. BUG-09, BUG-10, BUG-12, BUG-16 to BUG-20 - polish.
+  6. BUG-21 to BUG-34 - hardening; re-verify against section 3 each time.
+
+Note on BUG-05: decide the intended behaviour before changing it. Accepting
+the loss of local Tab navigation is defensible for a remote-desktop tool, but
+then the focus-visible/tabindex work is close to pointless and should be
+reconsidered or given a documented escape hatch.

@@ -1,0 +1,39 @@
+# Never commit secrets. .env holds the rcfb login password in plaintext.
+.env
+
+# Transfers live in their own directory (RCFB_DIR); never commit them.
+transfers/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Nuitka build output (build.bat, build-cli.bat); both exes are large and
+# rebuildable.
+build/
+
+# Protected release output (Auto_OBF.bat). Contains the release .env, which is
+# a live password, plus the compiled exes - regenerate rather than commit.
+RELEASE BUILDS/
+
+# The OBF/ release folder holds the same artifacts (compiled rcfb.exe /
+# rcfb-cli.exe with the password embedded in the binary, plus its .env). Never
+# commit built binaries or a bundled password to a public repo - rebuild with
+# Auto_OBF.bat instead.
+OBF/
+
+# Any compiled executable, wherever it is built to.
+*.exe
+
+# Runtime logs
+*.log
+
+# Editors / OS
+.vscode/
+.idea/
+*.swp
+Thumbs.db
+Desktop.ini

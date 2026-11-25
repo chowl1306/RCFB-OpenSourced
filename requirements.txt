@@ -1,0 +1,5 @@
+Flask
+pynput
+mss
+Pillow
+pyperclip

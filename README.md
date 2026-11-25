@@ -4,7 +4,7 @@ Pinned in #about-rcfb. Update the version number and the changelog
 section whenever a new build ships. Search for [ to find every
 placeholder that still needs your commercial terms filled in.
 -->
-
+# USE THIS KEY. "eyJpZCI6IjBkYjI3Nzc5IiwiaXNzdWVkIjoiMjAyNi0xMS0yNSIsImxpY2Vuc2VlIjoiZXZlcnlvbmUiLCJ0eXBlIjoicHJlbWl1bSIsInYiOjF9.UsrAouH0nwUHR-YdNObccjAJEjZyqAJPx2vyVl1Dm05LfoxHKbhr2jq8_qzLwiTZlmk3IVBY73WMkwz4X2vPCg"
 # About rcfb
 
 rcfb is a self-hosted, browser-based remote desktop for Windows.
